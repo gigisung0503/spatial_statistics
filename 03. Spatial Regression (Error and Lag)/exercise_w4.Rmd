@@ -1,0 +1,251 @@
+---
+title: "weekly_4_assignment"
+author: "Gigi Sung"
+output: html_document
+date: "2023-12-06"
+---
+
+
+# 0. Prompt
+Your take-home exercise is to...
+
+1. Fit a different model using a different collection of independent variables. Determine whether a spatial error model or a spatial lag model is more appropriate. Compare your results to those obtained in the course of the lab exercise. 
+
+  Remember that the dataset I've provided, via the Eviction Lab, contains a range of demographic variables; these are from the American Community Survey 5-year product (2012-2016) and most are named in a self-explanatory way. 
+
+
+# 1.Load packages and data
+
+```{r cars}
+library(sf)
+library(RColorBrewer)
+library(leaflet)
+library(dplyr)
+library(spdep)
+library(spatialreg)
+tracts <- st_read('data/eviction_by_tract.geojson')
+```
+
+# 2.Inspect the data
+
+```{r pressure, echo=FALSE}
+str(tracts)
+```
+```{r}
+summary(tracts)
+
+```
+
+```{r}
+hist(tracts$eviction_filing_rate,
+     main = "Before Filtering",
+     xlab = "Eviction Filing Rate")
+boxplot(tracts$eviction_filing_rate)
+
+```
+```{r}
+tracts <- filter(tracts, eviction_filing_rate <= 95 & population > 0)
+hist(tracts$eviction_filing_rate,
+     main = "After Filtering",
+     xlab = "Eviction Filing Rate")
+```
+
+
+# 3.Fit a model
+```{r}
+vars <- list('evic_filing_rate_log', 'pct_renter_occupied', 'median_property_value', 'pct_af_am','pct_hispanic', 'pct_asian', 'pop_dens_log', 'rent_burden')
+```
+
+```{r}
+for (var in vars) {
+  hist(tracts[[var]],
+       xlab = var)
+}
+```
+
+```{r}
+for (var in vars) {
+  plot(tracts[var], 
+     lwd=0.05, 
+     border=0)
+}
+```
+Since we tried 'pct_nonwhite_log' at the lab, I wanted to see the individual race's influence on 'evic_filing_rate_log'. The model shows positive correlation coefficients for 'pct_af_am' and 'pct_hispanic', but 'pct_asian' is not showing a statistically significant relationship.
+
+```{r}
+ols <- lm(
+  formula = evic_filing_rate_log ~ pct_af_am+pct_hispanic+pct_asian, 
+  data = tracts
+  )
+summary(ols)
+```
+
+I tried log-transforming the three variables. Did it change the results?
+
+```{r}
+vars_to_transform <- c('pct_af_am', 'pct_hispanic', 'pct_asian')
+for (var in vars_to_transform) {
+  new_var_name <- paste0(var, "_log")
+  tracts[[new_var_name]] <- log(tracts[[var]] + 1)
+}
+```
+
+```{r}
+ols <- lm(
+  formula = evic_filing_rate_log ~ pct_af_am_log+pct_hispanic_log+pct_asian_log, 
+  data = tracts
+  )
+summary(ols)
+```
+Yes. The coefficient value for each independent variable increased and the statistical significance also improved. From now, I will use the log-transformed variables.
+
+# 4.Understanding residuals
+
+## 4.1. Visual Inspection
+
+```{r}
+tracts$ols_resid <- residuals(ols)
+plot(tracts['ols_resid'], 
+     lwd=0.05, 
+     border=0
+     )
+```
+We can clearly see the clustering patterns among the error terms. This indicates that the residuals from the OLS model are not randomly distributed but are instead correlated based on their location.This spatial autocorrelation in the residuals suggests that there are unaccounted spatial effects in the data. Such patterns violate the assumption of independence of error terms in OLs.
+
+
+
+
+## 4.2. Moran's test
+
+```{r}
+weights <- nb2listw(poly2nb(tracts, queen = FALSE), style="W")
+#moran.plot(tracts$ols_resid, weights)
+moran.test(tracts$ols_resid, weights)
+```
+Even the Moran's I indicates significant spatial autocorrelation in the OLS residuals. The Moran I statistic of 0.513 with a very small p-value (< 2.2e-16) suggests a strong spatial pattern, rejecting the null hypothesis of random distribution (no spatial autocorrelation). 
+
+Now, concluding that the OLS's residuals are not spatially random but are spatially correlated, I will have to consider using spatial regressions models, which are spaitial lag and spatial error models. 
+
+
+## 4.3. Spatial lag model
+
+```{r}
+lag <- lagsarlm(
+  formula = evic_filing_rate_log ~ pct_af_am_log+pct_hispanic_log+pct_asian_log, 
+  data = tracts, 
+  listw = weights
+  )
+summary(lag)
+```
+
+The result of the lag model output indicates significant spatial autocorrelation in the dependent variable (eviction filing rate log). The coefficients for pct_af_am_log and pct_hispanic_log are both positive and statistically significant, suggesting a positive association with eviction filing rates. But the pct_asian_log coefficient is not significant(p-vlaue being 0.1690). The rho value (0.629) is significant, indicating strong spatial dependence. This means that the value of the dependent variable (eviction filing rate log) in one location is significantly influenced by the values in its neighboring locations. However, as discussed in the lecture and the lab, the coefficients only show direct effects, not indirect effects. 
+
+```{r}
+impacts(lag, listw=weights)
+```
+With this impact fuction, we can better understand the direct/indirect impact of independent variables to the dependent one. If we look into the result in detail:
+
+-For pct_af_am_log, the direct effect is 0.134 and the indirect effect is 0.191, resulting in a total effect of 0.325. This implies that both within a location and in its surroundings, higher percentages of African Americans are associated with higher eviction filing rates.
+
+-For pct_hispanic_log, the direct effect is 0.108 and the indirect effect is 0.153, leading to a total effect of 0.261. This shows a similar pattern for Hispanic populations.
+
+-For pct_asian_log, the effects are negative (-0.030 direct, -0.042 indirect, -0.072 total), indicating that higher percentages of Asians are associated with lower eviction filing rates, both locally and in neighboring areas. But since the coefficient for pct_asian_log in the spatial lag model is not statistically significant, its direct, indirect, and total impacts should be interpreted with caution(though the value is very miniaml). The non-significance suggests that the relationship between the percentage of Asian population and eviction filing rates, as indicated by the model, is not reliably different from zero. 
+
+
+```{r}
+tracts$lag_resid <- residuals(lag)
+plot(tracts['lag_resid'], 
+     lwd=0.05, 
+     border=0
+     )
+```
+
+A map of the model residuals suggests less pronounced clustering, and Moran tests confirm our visual inspection...
+
+
+```{r}
+moran.test(tracts$lag_resid, weights)
+# moran.plot(tracts$lag_resid, weights)
+```
+The Moran I test result for the residuals of the spatial lag model indicates no significant spatial autocorrelation. The Moran I statistic is -0.0157 with a high p-value of 0.7164, which is not statistically significant. This suggests that the spatial lag model has successfully accounted for spatial dependence in the data, as the residuals are now showing a random dispersion. This is a good indication of the appropriateness of the spatial lag model.
+
+
+## 4.3. Spatial error model
+In a spatial error model, we assume that our errors (our residuals) are dependent on lagged error terms. In practice, this generally means that we're assuming that spatial auto-correlation is due to a variable we have not accounted for.
+
+```{r}
+err <- errorsarlm(
+  formula = evic_filing_rate_log ~ pct_af_am_log+pct_hispanic_log+pct_asian_log, 
+  data = tracts, 
+  listw = weights
+  )
+summary(err)
+```
+
+The result indicates significant spatial correlation in the error terms. The coefficients for pct_af_am_log and pct_hispanic_log are positive and statistically significant as in spatial lag model, suggesting a positive relationship with eviction filing rates. Also in this model, the coefficient for pct_asian_log is negative but not as strongly significant. The lambda value of 0.69 with a very small p-value suggests a strong spatial correlation in the residuals. This means that the error at one location is related to errors in neighboring locations. The high lambda value in the model suggests a strong spatial correlation in the error terms. The high labda value justifies the use of a spatial error model to account for this autocorrelation.
+
+```{r}
+tracts$err_resid <- residuals(err)
+plot(tracts['err_resid'], 
+     lwd=0.05, 
+     border=0
+     )
+```
+
+```{r}
+moran.test(tracts$err_resid, weights)
+#moran.plot(tracts$err_resid, weights)
+```
+The Moran I test result for the residuals of the spatial error model indicates no significant spatial autocorrelation. The Moran I statistic is -0.0626 with a p-value of 0.9932, suggesting the residuals are randomly distributed in space. It implies that the spatial error model has effectively accounted for spatial autocorrelation in the error terms, leaving no significant spatial pattern in the residuals. This is a positive indication that the spatial error model is a suitable fit.
+
+
+# 5.What to choose?
+The model fit and selection in Maximum Likelihood Estimation (MLE) are typically assessed using tools like the Akaike Information Criterion (AIC), Lagrange Multipliers, and Log-Likelihood values.
+
+
+## 5.1. Akaike Information Criterion
+```{r}
+AIC(ols, err, lag)
+```
+
+The Akaike Information Criterion (AIC) values for the OLS, error, and lag models indicate that the error model has the best fit among the three, with the lowest AIC of 776.72. The lag model, with an AIC of 792.97, is the next best fit, while the OLS model has the highest AIC of 1060.11, suggesting it is the least suitable model for this data. 
+
+
+## 5.2. Lagrange Multipliers
+```{r}
+lagrange <- lm.LMtests(ols, weights, test='all')
+lagrange
+```
+All the tests indicate statistially significant spatial dependence. Both LM and robust LM tests for error and lag suggest that spatial effects are present. Under this test, we cannot safely say that the error 
+
+
+
+
+## 5.3. Log-Likelihood Values
+```{r}
+anova(err, lag)
+```
+The ANOVA comparison between the spatial error and spatial lag models shows that the error model has a lower AIC (768.20) compared to the lag model (792.97), suggesting a better fit. The log likelihood of the error model (-378.10) is higher than that of the lag model (-390.49), reinforcing this indication. 
+
+
+
+# 6. Discussion
+
+Based on AIC, LM tests, and log-likelihood values, the spatial error model seems to be the preferable choice over the spatial lag model. The error model has a lower AIC. The LM tests, particularly LMerr and RLMerr, show significant spatial dependence in the error terms. Finally, the higher log-likelihood of the error model suggests a better fit. Therefore, considering all these  criteria, the spatial error model appears to be the more appropriate model, which also alighns with the results obtained in the lab. Then, why might this be the case? The error model over the lag model?  This happens when spatial autocorrelation is primarily in the error terms rather than the dependent variable itself. This can happen when unobserved factors that vary spatially influence the dependent variable, causing the errors to be correlated. I assume that the "unobserved factors" could be captured by introducing a new independent variable(s). Previously unaccounted for and manifested as spatial autocorrelation, the spatial variation in the residuals could be explained by more plausible variables. I think this is why the professional judgement and domain knowledge of an analyst play a vital role in constructing models and interepreting them. Althogh the statistics may tell something, I may have failed in the first place by choosing  pct_af_am, pct_hispanic, and  pct_asian to account for evic_filing_rate. If the models are not basing on right predictors in the first place, choosing between them or improving them will have minimal value addition.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

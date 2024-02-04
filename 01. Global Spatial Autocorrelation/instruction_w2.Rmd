@@ -1,0 +1,231 @@
+---
+title: 'Lab 2: Spatial Autocorrelation'
+author: "Eric Robsky Huntley"
+date: "April 15, 2021"
+output: pdf_document
+links-as-notes: true
+always_allow_html: true
+---
+
+## Getting Started
+
+```{r message=FALSE, warning=FALSE}
+library(spdep)
+library(sf)
+library(tidyverse)
+library(leaflet)
+library(units)
+library(mapview)
+```
+
+Let's begin by reading in the data I've provided for today. This is a 500-meter gridded hexagon covering Cambridge and Somerville, containing estimates of housing unit counts and the total number of Airbnb units listed in each hexagon between 2014 and January 2019. I estimated the former based on parcel-level activity codes listed in the City of Somerville and City of Cambridge's assessor's databases. I did this using a `CASE ... WHEN ...` statement in QGIS.
+
+```
+CASE
+	WHEN "PropertyClass" = '4-8-UNIT-APT'  THEN 6
+	WHEN "PropertyClass" = '>8-UNIT-APT'  THEN 15
+	WHEN "PropertyClass" = 'CNDO LUX' THEN 1
+	WHEN "PropertyClass" = 'CONDOMINIUM' THEN 1
+	WHEN "PropertyClass" = 'MULT-RES-1FAM' THEN 1
+	WHEN "PropertyClass" = 'MULT-RES-2FAM' THEN 2
+	WHEN "PropertyClass" = 'MULT-RES-3FAM'  THEN 3
+	WHEN "PropertyClass" = 'MULT-RES-4-8-APT' THEN 6
+	WHEN "PropertyClass" = 'MULT-RES->8 APT'  THEN 15
+	WHEN "PropertyClass" = 'MULTI UNIT CNDO' THEN 3
+	WHEN "PropertyClass" = 'MULTIPLE-RES' THEN 2
+	WHEN "PropertyClass" = 'MXD 4-8-UNIT-APT' THEN 6
+	WHEN "PropertyClass" = 'MXD >8-UNIT-APT' THEN 15
+	WHEN "PropertyClass" = 'SINGLE FAM W/AUXILIARY APT' THEN 2
+	WHEN "PropertyClass" = 'SNGL-FAM-RES' THEN 1
+	WHEN "PropertyClass" = 'THREE-FM-RES' THEN 3
+	WHEN "PropertyClass" = 'TWO-FAM-RES' THEN 2
+END
+```
+
+Airbnb unit counts are based on [data acquired from AirDNA in January 2019](https://www.airdna.co/).
+
+We read in the data using the same `st_read` and piping syntax we used last time. I'm dropping hexagons with no housing units and creating a Airbnb per unit field.
+
+```{r}
+hex_grid <- st_read('data/grid_500m_abnb-units.shp') %>%
+  # Drop hexagons with no housing units.
+  drop_na(units) %>%
+  # Add an Airbnb per unit field.
+  mutate(
+    a_per_unit = abnb_count/units
+  )
+```
+
+## Exploratory Mapping
+
+Once we've added this data, we'll want to do some exploratory mapping. You'll often find that your eyes are all you need for a casual assessment of autocorrelation---when you look, intuitively, for patterns in your data, you're usually looking for autocorrelated observations. Let's do this two ways... first, let's use the very simple plot method of `sf` objects.
+
+```{r}
+plot(hex_grid['abnb_count'])
+plot(hex_grid['units'])
+plot(hex_grid['a_per_unit'])
+```
+
+We can see that, in the case of all of our variables, there's likely to be some autocorrelation, though they are clustered quite differently. We know this because, upon visible inspection, there are identifiable clusters and patches of higher unit and listing densities. This is the simple plot function, but you could make a much more interactive map using the `mapview` package.
+
+```{r}
+mapview(hex_grid['abnb_count'])
+```
+
+Finally, we can produce a somewhat similar map using RLeaflet. The code below is here for illustrative purposes...
+
+```{r}
+pal <- colorBin("magma", domain = hex_grid$units, bins = 5)
+leaflet(st_transform(hex_grid, 4326)) %>%
+  setView(-71.108915, 42.385355, 12) %>%
+  addProviderTiles("Stamen.Toner") %>%
+  addPolygons(
+    fillColor = ~pal(units),
+    weight = 1,
+    opacity = 1,
+    color = 'white',
+    fillOpacity = 0.8
+  ) %>%
+  addLegend(
+    pal = pal, 
+    values = ~units, 
+    opacity = 0.8,
+    title = NULL,
+    position = "bottomright")
+```
+
+## Modeling Adjacency
+
+Visual inspection has yielded likely autocorrelation! Which means that we'll next want to calculate a Moran's I statistic to test, statistically, how different the observed spatial distribution is from a random distribution of those same values. Recall that Moran's I is calculated like this...
+
+$$  
+I = [ \frac{n}{\sum_{i=1}^{n} (y_i - \bar{y})^2} ]*[ \frac{\sum_{i=1}^{n}\sum_{j=1}^{n}(y_i - \bar{y})(y_j - \bar{y})}{\sum_{i=1}^{n} \sum_{j=1}^{n} w_{ij}}]
+$$
+
+This calculation depends on the denominator in the second term ($\sum_{i=1}^{n} \sum_{j=1}^{n} w_{ij}$), which standardizes the numerator (the covariance between adjacent observations) by dividing by the total weight. We need a weights list!
+
+The `spdep` function gives us a very simple way to compute a weights list. First, we can use the `poly2nb` function to calculate a list of adjacencies. For each hexagon, this will determine which other hexagons share an edge (if `queen=FALSE`) or an edge or vertex (if `queen=TRUE`). In the case of hexagons, queen and rook are identical---these will never share a vertex without also sharing an edge.
+
+```{r}
+neighborhood <- poly2nb(hex_grid, queen=FALSE)
+head(neighborhood)
+```
+
+This is fairly interpretable! Hexagon in index position 1 is adjacent to the hexagons in index positions 2, 7, and 8. Hexagon in index position 2 is adjacent to the hexagons in index positions 1, 3, and 8. Etc.! We can also visualize this by mapping lines running between polygon centroids for adjacent hexagons. We first calculate the centroid coordinates by calculating the centroid of `hex_grid` (`st_centroid`), and retrieve only the coordinates in matrix form (`st_coordinates`).
+
+```{r warning=FALSE}
+# Rook's case neighborhood
+coords <- st_coordinates(st_centroid(hex_grid))
+plot(st_geometry(hex_grid), border='gray')
+plot(neighborhood, coords, col='red', lwd=1, add=TRUE)
+```
+
+Having calculated polygon adjacencies, all that is left is to attribute weights to those adjacencies. Recall that we can model adjacency using a row-standardized or a binary style---should each hexagon have the same weight (row-standardized), or should hexagons with more adjacencies have greater weight (binary)? We'll calculate both to denstrate that they do affect our results.
+
+```{r}
+# Convert to binary adjacency weight list..
+listw_binary <- nb2listw(
+  neighbours=neighborhood, 
+  style='B'
+  )
+head(listw_binary$weights)
+# Convert to row-standardized adjacency weight list.
+listw_rowst <- nb2listw(
+  neighbours=neighborhood, 
+  style='W'
+  )
+head(listw_rowst$weights)
+```
+
+Note that the weights calculated in the first `listw` are binary (adjacent or not) and the latter are row standardized (each adjacency is divided by the total number of adjacencies for the polygon).
+
+## Calculate Moran's I
+
+Weights list in hand, we can calculate our Moran's I quite simply, using the `moran.test()` function from `spdep`. We pass as parameters the field containing data we're assessing for autocorrelation, as well as our `listw`. Let's begin by looking at the raw count of Airbnb listings (`abnb_count`).
+
+```{r}
+abnb_moran_b <- moran.test(x = hex_grid$abnb_count, 
+                           listw = listw_binary)
+print(abnb_moran_b)
+```
+
+This returns a Moran's I statistic of `r abnb_moran_b[['estimate']]['Moran I statistic']`, with a p-value of `r abnb_moran_b$p.value`. Quite significant! And a very high Moran's I! From this, we can infer that like values are far more likely to cluster. This is not surprising to planners! We know that there are rarely random patches of density throughout cities; rather, Airbnb listings are going to tend to cluster around transportation hubs, places with many vacant rental units, and closer to amenities. We're seeing evidence of the kind of clustering that has always been of great interest to urbanists.
+
+But `r abnb_moran_b[['estimate']]['Moran I statistic']`... what does that mean? One very common way of visualizing Moran's I autocorrelation is through what's called a Moran's scatterplot. This is a type of plot that plots observed values, on the x-axis, against lagged (i.e., adjacent) observed values on the y-axis.
+
+```{r}
+moran.plot(hex_grid$abnb_count, listw_binary)
+```
+
+Observations in the first quadrant (positive x and y) and third quadrant (negative x and y) contribute to autocorrelation. Our Moran's I value is simply the slope of the fit line.
+
+### Simulating Moran's I
+
+At this point, we've demonstrated statistically significant spatial autocorrelation. One additional common step in a workflow intended to demonstrate spatial autocorrelation is to run a series of Monte Carlo simulations and evaluate the observed Moran's I against the distribution of the simulated Moran's I. In our case, this means that we're going to randomly 'shuffle' the observed values to different spatial locations and reassess, in each case, the Moran's I. We can then plot the frequency distribution of those simulated Moran's I values against our observed value.
+
+```{r warning=FALSE}
+abnb_mc <- moran.mc(hex_grid$abnb_count, listw_binary, nsim=999)
+hist(abnb_mc$res)
+abline(v=abnb_mc['statistic'], col='red', lwd=2)
+```
+
+We confirm here, again, that our observed value is far on the outside edge of the distribution.
+
+## Neighborhood Matters
+
+Above, we calculated a second 'version' of our weights list using a row-standardized rather than binary approach. Let's see what happens when we run the same analysis using the alternative scheme...
+
+```{r}
+abnb_moran_r <- moran.test(x = hex_grid$abnb_count, 
+                           listw = listw_rowst)
+print(abnb_moran_b)
+print(abnb_moran_r)
+```
+
+Our results are different! Maybe not enormously so, but enough that we can see how alternative neighborhoods can affect our findings. We can demonstrate this more dramatically by constructing our neighborhood using distance rather than adjacency.
+
+Unfortunately, there's not a quick utility function for this approach to neighborhood construction, but this is useful for learning purposes---we can dig into the step-by-step construction of a weights list, rather than giving the job to tidy functions.
+
+First, we calculate distance between the centroids of our hexagons, removing the, in principal, useful but, in practice, slightly cumbersome 'units' that come attached to the returned matrix.
+
+```{r}
+centroids <- st_centroid(hex_grid)
+distances <- st_distance(centroids, centroids) %>%
+  set_units(NULL)
+```
+
+This creates a dense matrix of the distance between each hexagon and all others. But! let's say we're theorizing that a salient 'neighborhood' is any hexagon within half-a-mile (3640 feet). We can set all distances greater than that value equal to zero.
+
+```{r}
+distances[distances > 6640] <- 0
+```
+
+However, if we use this as our matrix, we're going to weight more distant hexagons more heavily than nearby polygons---this runs counter to what we've called 'the first law of geography' following Waldo Tobler! This being that close things are more related than distant things. As such, let's invert each distance, creating an __Inverse Distance Matrix__. We use an `ifelse` because we can't divide by zero.
+
+We're furthermore going to divide by the distance squared---inverse power functions like this are very common ways to generate weights. You can experiment with this parameter, seing how it affects your results.
+
+```{r}
+inverse_dist <- ifelse(distances!=0, 1/(distances^2), distances)
+```
+
+Finally, we use the `mat2listw` function to convert our inverse distance matrix to the `listw` object expected by `moran.test`.
+
+```{r}
+inverse_dist_listw <- mat2listw(inverse_dist, style="W")
+moran.test(x = hex_grid$abnb_count, listw = inverse_dist_listw)
+abnb_moran_dist_mc <- moran.mc(hex_grid$abnb_count, inverse_dist_listw, nsim=999)
+hist(abnb_moran_dist_mc$res)
+abline(v=abnb_moran_dist_mc['statistic'], col='red', lwd=2)
+```
+
+## Take-Home
+
+We've now walked through a fairly standard workflow for assessing spatial autocorrelation using Moran's I, but we've only done so for the count of Airbnb units. Your tasks are...
+
+1. to perform the same analysis for both the estimated number of housing units and the rate of Airbnb listings per unit. Use at least two different weighting schemes (row standardized, binary, inverse distance) but use the same two for each variable so that your results are comparable.
+s
+2. Based on your results, discuss why it is that the number of airbnb units per housing unit is so different in its observed autocorrelation. Think about the role that urban space's 'non-uniformity' might be playing.
+
+3. O'Sullivan and Unwin discuss an alternative metric for autocorrelation: Geary's C. Calculate this statistic in addition to Moran's I. The results should be fairly similar... but how is the interpretation of Geary's C different? `spdep` has a function, like `moran.test` for Geary's C---`geary.test()`. Feel free to use this!
+
+4. Construct weights lists using multiple distances---you'll notice that the observed Moran's I falls as the distance increases. Why is this?

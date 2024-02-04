@@ -1,0 +1,278 @@
+---
+title: 'Lab 4: Spatial Regression'
+author: "Eric Robsky Huntley"
+output:
+  pdf_document: default
+  word_document: default
+  html_notebook: default
+---
+
+Today, we'll be examining regression models that account for spatial dependency (e.g., spatial lag and spatial regression models).We're going to be concerned with model evaluation; how do we decide which model to use, once we decide that spatial dependence is something we have to account for? We'll discuss three primary means of evaluating our models:
+
+1. Lagrange Multiplier tests.
+2. The Akaike Information Criterion, or AIC.
+3. Log-likelihood approaches.
+
+Once again, we'll be using data drawn from the [Eviction Lab at Princeton University](https://evictionlab.org/). I'll also, again, draw your attention to the fact that there have been substantial critiques of both [the data and the lab's approach](https://shelterforce.org/2018/08/22/eviction-lab-misses-the-mark/). While we won't be delving deep into the problems raised by the authors of the Shelterforce piece, they are salient! And any analysis undertaken with this data should reckon with them.
+
+## Getting Ready
+
+We begin by loading the necessary libraries---for spatial regression, `spdep` and `spatialreg` are the important libraries to note. The former provides functions that allow us to easily construct weights matricies, and the latter offers extensions of the `lm` function that account for spatial dependence. We also read the provided `.geojson` file and store it in a new Simple Features (`sf`) dataframe.
+
+```{r message=FALSE, warning=FALSE}
+library(sf)
+library(RColorBrewer)
+library(leaflet)
+library(dplyr)
+library(spdep)
+library(spatialreg)
+tracts <- st_read('data/eviction_by_tract.geojson')
+```
+
+Plotting a histogram of our observed filing rates reveals some rather anomalous values.
+
+```{r}
+hist(tracts$eviction_filing_rate,
+     main = "Before Filtering",
+     xlab = "Eviction Filing Rate")
+```
+
+We'll filter out these outliers that we assume represent errors in the accounting, and also filter out tracts where the population density is zero.
+
+```{r}
+tracts <- filter(tracts, eviction_filing_rate <= 95 & population > 0)
+hist(tracts$eviction_filing_rate,
+     main = "After Filtering",
+     xlab = "Eviction Filing Rate")
+```
+
+Finally, I've provided a log-transformed eviction filing rate that more closely approximates a normal distribution.
+
+```{r}
+hist(tracts$evic_filing_rate_log,
+     main = "",
+     xlab = "Log-Transformed Eviction Filing Rate")
+```
+
+We plot our log-transformed eviction filing rate and note that, on visual inspection, there is substantial clustering in the response variable.
+
+```{r}
+plot(tracts['evic_filing_rate_log'], 
+     lwd=0.05, 
+     border=0
+     )
+```
+
+## Test Response Variable for Autocorrelation
+
+As we know, we can test for autocorrelation using a Moran's I test... this is review at this point. We create a row-normalized weights matrix using rook contiguity and test.
+
+```{r}
+weights <- nb2listw(poly2nb(tracts, queen = FALSE), style="W")
+evic_moran <- moran.test(tracts$evic_filing_rate_log, weights)
+evic_moran
+moran.plot(tracts$evic_filing_rate_log, weights)
+```
+
+We see statistically significant spatial autocorrelation! However, the presence of autocorrelation in our response variable does _not_ necessarily mean that our models will see autocorrelation in their errors. This is because our explanatory variables _may_ account for the clustering behavior. Spatial regression becomes necessary, not when the dependent variable is autocorrlated, but when we see autocorrelation in the residuals of an OLS model.
+
+## Run Standard OLS
+
+Recall that a standard OLS model is specified like this:
+
+$$
+y = \beta_{0} + \beta_{1}x_{1} + \beta_{2}x_{2} + ... + \beta_{n}x_{n} + \epsilon
+$$
+
+We assume, given patterns of racialized disinvestment and the association between housing precarity and poverty, that the poverty rate and the percentage of a population identifying as non-white will account for much of the variation in eviction filing rates. We test this by building a standard linear model.
+
+```{r}
+ols <- lm(
+  formula = evic_filing_rate_log ~ pov_rate_log + pct_nonwhite_log, 
+  data = tracts
+  )
+summary(ols)
+```
+
+We do, indeed, see statistically significant positive relationships between both of our explanatory variables and the eviction filing rate. Our coefficient of determination, or $R^{2}$ is modest (.29), but this is not surprising---it would be enormously reductive to think that eviction filings are fully explained by either racism or income disparity.
+
+The salient question for our puposes today is: have these two explanatory variables accounted for the autocorrelation we observed in our response variable? To start, let's map the residuals...
+
+```{r}
+tracts$ols_resid <- residuals(ols)
+plot(tracts['ols_resid'], 
+     lwd=0.05, 
+     border=0
+     )
+```
+
+Visual inspection, again, suggests that our residuals are autocorrelated! Like values appear to tend to be near like values. There are clusters of large positive errors and clusters of large negative errors. We can test this using a Moran's test...
+
+```{r}
+moran.plot(tracts$ols_resid, weights)
+moran.test(tracts$ols_resid, weights)
+```
+
+While the value of the global Moran's I is _less_ positive, it still indicates the presence of strong positive autocorrelation. This is the condition under which we consider applying spatial regression methods! Recall that we introduced two in lecture---spatial lag, in which lagged observations of the response variable are taken to explain autocorrelation in the response variable, and spatial error, in which lagged errors are taken to explain autocorrelation in the residuals. Let's start with the the fformer case.
+
+## Spatial Lag Modeling
+
+A spatial lag model is given by...
+
+$$
+Y = \beta_{0} + \beta_{1} X_{1} + ... + \beta_{n} X_{n} + \rho W y + \epsilon
+$$
+
+Where W is a weights matrix, $\rho$ (rho) is a spatial lag parameter. We've introduced a new term that asserts that our response variable is dependent on lagged (i.e., adjancent) values of itself.
+
+Such a model can be fit using the `lagsarlm` function from the `spatialreg` library. The syntax is identical to a standard `lm` except we pass the weights list to the `listw` parameter.
+
+```{r}
+lag <- lagsarlm(
+  formula = evic_filing_rate_log ~ pov_rate_log + pct_nonwhite_log, 
+  data = tracts, 
+  listw = weights
+  )
+summary(lag)
+```
+
+Our results tell us quite a lot. We have a `rho` value of 0.64, indicating strong positive autocorrelation between an observation of the response variable and lagged observations. It is highly significant! Furthermore, we note that both the poverty rate and the percentage nonwhite coefficients retain their positive relationships that meet conventional significance thresholds. 
+
+As discussed in lecture, though, these coefficients are quite difficult to interpret. Like an ordinary OLS model, a unit change in one explanatory variable will lead to a direct effect on the response variable, as in a normal OLS model. An increase in the poverty level will contribute to an increase in the eviction filing rate. However, this increased filling rate is then modeled as having effects on adjancent filing rates, which subsequently have effects on the initial tract’s filing rate... Model coefficients depict only direct effects, not indirect effects. We can parse these out using the `impacts` function.
+
+```{r}
+impacts(lag, listw=weights)
+```
+
+
+This returns three columns: the direct effects of a unit change, which is to say the local effects; the indirect effects, which is to say the effect _of the effect_ on its neighboring tracts, and the total, which estimates the total effect, including direct and indrect effects.
+
+However, the question is: did this account for autoregression in our errors? Let's see whether the residuals of the lag model are autocorrelated.
+
+```{r}
+tracts$lag_resid <- residuals(lag)
+plot(tracts['lag_resid'], 
+     lwd=0.05, 
+     border=0
+     )
+```
+
+A map of the model residuals suggests less pronounced clustering, and Moran tests confirm our visual inspection...
+
+```{r}
+moran.test(tracts$lag_resid, weights)
+moran.plot(tracts$lag_resid, weights)
+```
+
+We do not observe spatial autocorrelation in our model residuals! Our Moran's I is very close to zero and we observe a _very_ high p value.
+
+However, we also have other tools available to us! Instead of a spatial lag model, we could have fit a spatial error model. We'll do this now... to give away the secret a bit, we'll find that it also performs fairly well. Which will beg the question: which model do we use?
+
+## Spatial Error Modeling
+
+In a spatial error model, we assume that our errors (our residuals) are dependent on lagged error terms. In practice, this generally means that we're assuming that spatial auto-correlation is due to a variable we have not accounted for.
+
+$$
+Y = \beta_{0} + \beta_{1} X_{1} + ... + \beta_{n} X_{n} + u \\
+u = \lambda W u + \epsilon
+$$
+
+Here, the error term ($\epsilon$) is decomposed into a spatially lagged error term ($\lambda W u$) and an identically and independently distributed error term ($\epsilon$). $\lambda$ is very similar to $\rho$ in the spatial lag model---it indicates the presence of positive, negative or no autocorrelation.
+
+Much like the `lagsarlm` function above, we can fit a spatial error model using...
+
+```{r}
+err <- errorsarlm(
+  formula = evic_filing_rate_log ~ pov_rate_log + pct_nonwhite_log, 
+  data = tracts, 
+  listw = weights
+  )
+summary(err)
+```
+
+We have a strongly positive, statistically significant $\lambda$ value, indicating that our errors are positively autocorrelated. We also have statistically significant, still-positive coefficients for both our poverty rate and percentage non-white.
+
+Note that, unlike the case of our spatial lag model, we can interpret the coefficients directly. This is because the observed autocorrelation in our OLS residuals is assumed to be due to adjacent residuals, not lagged response variables. In this way, spatial error models are, in some ways, easier to interpret... and in other ways more difficult. We can read our coefficients directly, but we also throw up our hands and assume that the autocorrelation is due to the uncaptured influence of... something else.
+
+Inspecting a map for autocorrelation in model residuals, we again see a distribution that leads us to suspect that we've eliminated spatial autocorrelation.
+
+```{r}
+tracts$err_resid <- residuals(err)
+plot(tracts['err_resid'], 
+     lwd=0.05, 
+     border=0
+     )
+```
+
+Our Moran tests and plots indicate the same.
+
+```{r}
+moran.test(tracts$err_resid, weights)
+moran.plot(tracts$err_resid, weights)
+```
+
+Given these outcomes, we're left with a rather difficult question: which of these models should we use? They both eliminate autocorrelation in our residuals, and all lead to statistically significant coefficients and spatial error parameters. Furthermore, 
+
+## So Which Do we Choose?
+
+You've probably noticed that neither our lag model nor our error model returned $R^{2}$ values. This is because these models are _not_ fit using only least-squared estimation (OLS). Rather, they are fit using Maximum Likelihood Estimation (MLE), which fits coefficients and parameters such that the likelihood of the observed values is maximized. $R^{2}$ evaluates model fit for OLS criterion, but does not apply for models fit using MLE. Instead, we'll be using the...
+
+1. Akaike Information Criterion (AIC)
+2. Lagrange Multipliers
+3. Log-Likelihood Values
+
+## Akaike Information Criterion
+
+The AIC is a statistic used to evaluate model fit. It is given by...
+
+$$
+AIC = 2k - 2 \ln({\hat{L}})
+$$
+
+In the above, $k$ is the number of parameters estimated in the model, and $\ln({\hat{L}})$ is the log-likelihood. The notion here is that a model is penalized for modeling too many parameters... in other words, overfitting, or the inflation of model fit through the addition of parameters, is discouraged. As $k$ increases, the score increases. As the likelihood increases, the value of the AIC decreases.
+
+This means that we're going to tend to try and minimize the AIC. Our models above give results like this...
+
+```{r}
+AIC(ols, err, lag)
+```
+
+### Log-Likelihood
+
+On this basis, we should choose the spatial error model. Similarly, we could choose the model based on the log-likelihood alone---this is similar to the AIC, but not penalize the model for overfitting. We can examine the relationships between these evaluative criteria by printing an ANOVA table...
+
+```{r}
+anova(err, lag)
+```
+
+We are attempting to _minimize_ the AIC and _maximize_ the log-likelihood. In this case, these criteria are both met by the `err` model.
+
+### Lagrange Multiplier Tests
+
+A _lagrange multiplier test_ is another common means for evaluating the appropriateness of spatial model. This diagnostic tests the results of an OLS model for a range of forms of spatial dependence:
+
+1. Error dependence (called `LMerr`).
+2. A missing spatially lagged dependent variable (called `LMlag`).
+3. Error dependence robust to the possible presence of missing lagged dependent variable (called `RLMerr`, for Robust).
+4. A missing lagged dependent variable robust to the possible presence of error dependence (called `RLMlag` for Robust).
+
+```{r}
+legrange <- lm.LMtests(ols, weights, test='all')
+legrange
+```
+
+Both of our non-robust tests are statistically significant, so we turn to the robust forms. Between our two robust forms, the error model has a higher LM value and lower p-value. This suggests that the error model is the more appropriate model, agreeing with our model evaluation using the AIC and Log-likelihood metrics.
+
+## Summary
+
+In this lab, we fitted both spatial lag and spatial error models, noting some of the differences in interpretation and evaluation between the two models. Both models addressed the presence of autocorrelation in our residuals... which raised the question of which model we should select. We addressed three common statistics used to evaluate model fit: the AIC (which we try to minimize), the log-likelihood (which we try to maximize), and the legrange multiplier (which we try to maximize). All three means of evaluation told us the same thing: that the spatial error model was a better fit given our observed data. This process is summarized in a useful flowchart developed by Luc Anselin...
+
+![Flowchart developed by Luc Anselin, reprinted in an excellent tutorial by Dr. Emily Burchfield.](images/anselin_flowchart.jpeg)
+
+## Take-Home
+
+Your take-home exercise is to...
+
+1. Fit a different model using a different collection of independent variables. Determine whether a spatial error model or a spatial lag model is more appropriate. Compare your results to those obtained in the course of the lab exercise. 
+
+  Remember that the dataset I've provided, via the Eviction Lab, contains a range of demographic variables; these are from the American Community Survey 5-year product (2012-2016) and most are named in a self-explanatory way. 

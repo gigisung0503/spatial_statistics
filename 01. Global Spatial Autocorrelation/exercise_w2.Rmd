@@ -1,0 +1,344 @@
+---
+title: "weekly_exercise_2 | Gigi Sung"
+output: html_document
+date: "2023-11-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Concept Review
+```{r}
+library(spdep)
+library(sf)
+library(tidyverse)
+library(leaflet)
+library(units)
+library(mapview)
+```
+## Read in Airbnb Data
+
+
+-Drop cells with no units. 
+-Create a new feature a_per_unit where it is abnb_count/units.
+-Returned variable: hex_grid
+
+```{r}
+hex_grid <- st_read('data 3/grid_500m_abnb-units.shp') %>%
+  # Drop hexagons with no housing units.
+  drop_na(units) %>%
+    # Add an Airbnb per unit field.
+  mutate(
+  a_per_unit = abnb_count/units
+  )
+```
+## Visual Inspection
+
+```{r}
+plot(hex_grid['abnb_count'])
+```
+
+- 'units' refers to the  estimates of housing unit counts in a cell.
+```{r}
+plot(hex_grid['units'])
+
+```
+
+
+```{r}
+plot(hex_grid['a_per_unit'])
+
+```
+
+
+## Statistical Inspection
+
+Now, to statistically prove the visual insight, I will use the following tool, Moran's I. 
+
+### What is Moran's I?
+
+Moran's I is a statistic used to measure spatial autocorrelation, which is the degree to which one object is similar to other objects nearby. It's a way to detect patterns where similar values occur close to each other in space.
+
+#### Components of Moran's I
+
+The Moran's I statistic is given by:
+
+$$
+I = \left[ \left( \frac{n}{\sum_{i=1}^{n} (y_i - \bar{y})^2} \right) \times \left( \frac{\sum_{i=1}^{n} \sum_{j=1}^{n} (y_i - \bar{y})(y_j - \bar{y})}{\sum_{i=1}^{n} \sum_{j=1}^{n} w_{ij}} \right) \right]
+$$
+
+Where:
+
+- \( n \) is the number of spatial units.
+- \( y_i \) is the value of the variable at spatial unit \( i \).
+- \( \bar{y} \) is the mean value of the variable across all spatial units.
+- \( w_{ij} \) is the element of the spatial weight matrix \( W \), corresponding to the spatial units \( i \) and \( j \).
+
+### Breakdown of the equation
+
+
+
+#### Interpretation of Moran's I
+
+Moran's I values range from -1 (indicating perfect dispersion) to +1 (indicating perfect correlation).
+
+
+
+
+
+
+### Weight Matrix (Queen or Rook)
+
+
+
+```{r}
+neighborhood <- poly2nb(hex_grid, queen=FALSE)
+head(neighborhood)
+```
+
+#### Visualize Adjacency by Linking Centroids
+
+
+```{r}
+# Rook's case neighborhood
+coords <- st_coordinates(st_centroid(hex_grid))
+plot(st_geometry(hex_grid), border='gray')
+plot(neighborhood, coords, col='red', lwd=1, add=TRUE)
+```
+
+
+#### Attribute Weights to Adjacency
+
+##### Binary Weights
+```{r}
+listw_binary <- nb2listw(
+neighbours=neighborhood,
+style='B'
+)
+head(listw_binary$weights)
+```
+
+
+##### Row-standardized Weights
+```{r}
+listw_rowst <- nb2listw(
+neighbours=neighborhood,
+style='W'
+)
+head(listw_rowst$weights)
+```
+
+### Calculate Moran's I with Binary Weights
+
+```{r}
+abnb_moran_b <- moran.test(x = hex_grid$abnb_count,
+listw = listw_binary)
+print(abnb_moran_b)
+```
+We get the value of 0.662394180, which is also happen to be statistically significant. 
+
+Moran's scatterplot helps to visually understand the value of Moran's I. The value of 0.662394180 shows a quite clear trend. 
+
+But what is "lagged abnb_count?"
+
+$$
+L(y_i) = \sum_{j=1}^{n} w_{ij} y_j
+$$
+
+- \( L(y_i) \) is the lagged value of `abnb_count` for spatial unit \( i \).
+- \( w_{ij} \) is the spatial weight between units \( i \) and \( j \), taken from the spatial weight matrix. In the case of binary weights, \( w_{ij} \) is 1 if \( i \) and \( j \) are neighbors and 0 otherwise.
+- \( y_j \) is the value of `abnb_count` for spatial unit \( j \).
+
+
+
+The lagged value of `abnb_count` for a spatial unit \( i \) can be mathematically defined as the weighted sum of `abnb_count` from the neighboring units(excluding the unit itself). If we denote the lagged value by \( L(y_i) \), where \( y_i \) represents the `abnb_count` for spatial unit \( i \), and \( w_{ij} \) as the element of the spatial weight matrix between units \( i \) and \( j \), the lagged value is given by the function above.
+
+
+
+
+
+```{r}
+moran.plot(hex_grid$abnb_count, listw_binary)
+```
+
+### Simulating Moran'I, Monte Carlo 
+
+
+
+```{r}
+abnb_mc <- moran.mc(hex_grid$abnb_count, listw_binary, nsim=999)
+hist(abnb_mc$res)
+abline(v=abnb_mc['statistic'], col='red', lwd=2)
+```
+We are testing if the observed spatial autocorrelation was random or not. From the simulated results, we can say that the observed value was not due to random chance.However, from the histogram, we cannot disscuss its statistical significance. 
+
+
+### Alternative Neighborhoods
+
+#### Calculate Moran's I with Row-standardized Weights
+
+```{r}
+abnb_moran_r <- moran.test(x = hex_grid$abnb_count,
+listw = listw_rowst)
+print(abnb_moran_r)
+```
+We got the value of 0.629933356.
+```{r}
+print(abnb_moran_b)
+```
+
+
+Recall that under binary weights, we got 0.662394180.
+
+#### Calculate Moran's I using Distance
+```{r}
+centroids <- st_centroid(hex_grid)
+distances <- st_distance(centroids, centroids) %>%
+set_units(NULL)
+```
+
+The result(distances) is a matrix of the distance between each hexagon and all others. 
+
+```{r}
+distances[distances > 3640] <- 0
+```
+
+We just gave more preference to those within half-a-mile by setting all distances outside to zero.
+
+
+```{r}
+inverse_dist <- ifelse(distances!=0, 1/(distances^2), distances)
+```
+
+'inverse_dist' is a weight matix that we can use. The nearer, the greater value.
+
+```{r}
+inverse_dist_listw <- mat2listw(inverse_dist, style="W")
+moran.test(x = hex_grid$abnb_count, listw = inverse_dist_listw)
+```
+
+We assigned to a list object, ready to be passed as a parameter to moran.test.
+
+```{r}
+abnb_moran_dist_mc <- moran.mc(hex_grid$abnb_count, inverse_dist_listw, nsim=999)
+hist(abnb_moran_dist_mc$res)
+abline(v=abnb_moran_dist_mc['statistic'], col='red', lwd=2)
+```
+
+
+# Problem Set
+
+## 1. The number of housing units and the rate of Airbnb listings per unit
+
+### Setting Parameters
+```{r}
+neighborhood <- poly2nb(hex_grid, queen = FALSE)
+
+weights_row_standardized <- nb2listw(neighborhood, style = "W")
+weights_binary <- nb2listw(neighborhood, style = "B")
+```
+### Calculate Moran's I for 'units'
+```{r}
+moran_units_row <- moran.test(hex_grid$units, weights_row_standardized)
+moran_units_binary <- moran.test(hex_grid$units, weights_binary)
+```
+
+### Calculate Moran's I for 'a_per_unit'
+```{r}
+moran_rate_row <- moran.test(hex_grid$a_per_unit, weights_row_standardized)
+moran_rate_binary <- moran.test(hex_grid$a_per_unit, weights_binary)
+```
+
+```{r}
+moran_units_row
+moran_units_binary
+moran_rate_row
+moran_rate_binary
+```
+For 'units', both statistics show significant postive sptial autocorrelation. However, for 'a_per_unit', both of the values suggest weeker sptial autocorrelation. In sum, the autocorrelation is stronger for the number of housing units compared to the rate of Airbnb listings per unit. This could be due to the misalignment of housing units clusters and Airbnb listings cluasters, which might be influenced by various factors like tourism and local regulations
+
+
+## 2. Discuss why it is that the number of airbnb units per housing unit is so different in its observed autocorrelation.
+
+The distinct differences in Moran I values for Airbnb listings per housing unit under different weighting schemes (row standardized vs. binary) can be attributed to the non-uniformity of urban spaces.
+
+Under a binary weighting scheme, each neighbor is assigned a weight of 1, while non-neighbors are given 0. This means that the presence or absence of a neighbor is the only factor considered. So, in the case of a feature(i.e., x_i)  with many neighbors, each neighbor contributes equally to the calculation of Moran's I, which means that binary weighting doesn't differentiate between dense and sparse areas
+
+In contrast, row-standardized weights adjust for the number of neighbors by normalizing the weights. This nature of row-standardization makes Moran's I more sensitive to variations in neighborhood density. In areas with many neighbors, the influence of each neighbor is reduced (since the weights sum to 1), while in areas with few neighbors, each neighbor's influence is relatively higher. In other words, binary weighting can overempphasize the influence of dense areas. Of course urban spaces are non-uniform in density, but binary weighting does not have a devise to account for the effect of density(bias).
+
+
+
+
+## 3. Moran's I vs Geary’s C
+
+```{r}
+geary_units_row <- geary.test(hex_grid$units, weights_row_standardized)
+geary_units_binary <- geary.test(hex_grid$units, weights_binary)
+
+geary_rate_row <- geary.test(hex_grid$a_per_unit, weights_row_standardized)
+geary_rate_binary <- geary.test(hex_grid$a_per_unit, weights_binary)
+
+geary_units_row
+geary_units_binary
+geary_rate_row
+geary_rate_binary
+
+```
+Abbreviated Moran's I 
+
+$$
+I = \frac{\sum_{i=1}^{N} \sum_{j=1}^{N} w_{ij}(x_i - \bar{x})(x_j - \bar{x})}{\sum_{i=1}^{N}(x_i - \bar{x})^2}
+$$
+
+Abbreviated Geary's C
+$$
+C = \frac{\sum_{i=1}^{N} \sum_{j=1}^{N} w_{ij}(x_i - x_j)^2}{2 \sum_{i=1}^{N}(x_i - \bar{x})^2}
+$$
+
+If we cancel out all the same components, we have differences in the denominator:
+
+$$
+   w_{ij}(x_i - \bar{x})(x_j - \bar{x})
+$$
+$$
+   w_{ij}(x_i - x_j)^2
+$$
+
+Moran's I are seeking the variance from the global mean, while Geary's C defining the variance directly between neighbors, making the latter more sensitive to local variances. 
+
+Then, considering the unique characteristics of Moran's I and Geary's C, the observed Geary's C statistics for 'units' indicate positive autocorrelation but suggest that this autocorrelation is more pronounced on a local scale. While Moran's I assesses spatial distribution relative to a global mean and identifying broader clustering or dispersion patterns, Geary's C focuses on the differences between individual units and their immediate neighbors. This emphasis on local differences means that the Geary's C values for 'units', though still indicative of positive autocorrelation, point to spatial phenomena that are more localized in nature.
+
+## 4. Multiple Distances
+
+Here, I used 'abnb_count'.
+The loop is calculating Moran's I using Inverse Distance Weighting method. 'distance_thresolds' increases by 500 meteres up to 6 kilometers.
+
+```{r}
+centroids <- st_centroid(hex_grid)
+distance_thresholds <- seq(3500, 6000, by = 500) 
+moran_results <- list()
+for (threshold in distance_thresholds) {
+    # Calculate distances
+    distances <- st_distance(centroids, centroids) %>%
+    set_units(NULL)
+    distances[distances > threshold] <- 0
+    inverse_dist <- ifelse(distances != 0, 1/(distances^2), distances)
+    inverse_dist_listw <- mat2listw(inverse_dist, style = "W")
+    moran_results[[as.character(threshold)]] <- moran.test(x = hex_grid$abnb_count, listw = inverse_dist_listw)
+}
+
+```
+
+
+```{r}
+moran_results
+```
+
+
+We can think of Tobler's First Law of Geography: "Everything is related to everything else, but near things are more related than distant things."
+
+Statistically speaking, the observed Moran's I decreases as the distance increases. It is natural because the local spatial pattern gets dilluted with noises. As the boundary gets bigger, there is a higher chance of "dispersion"/"randomness" getting in.     
+
+
+

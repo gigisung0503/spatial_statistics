@@ -1,0 +1,256 @@
+---
+title: 'Lab 3: Local Statistics'
+author: "Eric Robsky Huntley, PhD"
+date: "November 21, 2023"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+## Introduction
+
+In lab today, we'll be implementing statistics discussed in lecture last Thursday---the Getis Ord $ G_{i} $ and $ G_{i}^{*} $, as well as the local Moran's I. We'll be paying particular attention to the adjustments to statistical significance thresholds that are necessary to speak about 'inference' for local statistics. In this lab, we'll be primarily focusing on tree counts in Cambridge and Somerville, measured per linear foot of street. Data for this exercise is drawn from the [City of Somerville Urban Forestry Division](https://www.somervillema.gov/departments/ospcd/psuf/urban-forestry) and the [City of Cambridge’s Department of Public Works](https://www.cambridgema.gov/GIS/gisdatadictionary/Environmental/ENVIRONMENTAL_StreetTrees).
+
+If you want some ideas regarding how you might not only analyze this data in R, but also map it using [R's wrapper](https://rstudio.github.io/leaflet/) for the [Leaflet.js](https://leafletjs.com/) package, check out this [DUSPviz tutorial](https://duspviz.org/tutorials/modules/13/).
+
+## Getis Ord Gi
+
+The first thing we have to do is construct _neighborhoods_ for each cell. Local statistics, after all, are local! And we have to model what 'local' is going to look like. Let's keep it simple and use a polygon adjacency matrix with only one lag, based on the 'Rook' adjacency criterion (regions are adjacent if they share edges, but not if they share vertices). Recall that for hexagons, this is equivalent to the queen adjacency criterion. We also convert the resulting `nb` object called `neighborhood` to a list of weights contained in a `listw` object in a binary, or `B` (i.e., non-row standardized) style. This is more-or-less standard when calculating local statistics---row standardization can actually throw off your results.
+
+But first we'll generate a hexagonal grid and count trees per length of road.
+
+```{r}
+require('readr')
+
+somerville <- readr::read_csv('somerville.csv') |>
+  sf::st_as_sf(coords=c("Longitude", "Latitude"), crs=4326) |>
+  sf::st_transform(2249) |>
+  dplyr::select(id = Site)
+cambridge <- readr::read_csv('cambridge.csv') |>
+  sf::st_as_sf(wkt="Geometry", crs=4326) |>
+  dplyr::rowwise() |>
+  dplyr::mutate(
+    lon = sf::st_coordinates(Geometry)[1]
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::filter(
+    (abs(lon) > 1)
+  ) |>
+  sf::st_transform(2249) |>
+  dplyr::select(id = `Tree ID`) |>
+  sf::st_set_geometry("geometry")
+
+trees <- somerville |>
+  dplyr::bind_rows(cambridge)
+
+hex_grid <- trees |>
+  sf::st_make_grid(
+    cellsize=units::as_units(250, 'm'), 
+    square=FALSE
+    ) |>
+  sf::st_as_sf() |>
+  sf::st_set_geometry("geometry") |>
+  dplyr::mutate(
+    hex_id = dplyr::row_number()
+  )
+
+roads <- tigris::roads(state = "MA", count = "Middlesex", year = 2020) |>
+  sf::st_transform(2249)
+
+tree_counts <- trees |>
+  sf::st_intersection(hex_grid) |>
+  sf::st_drop_geometry() |>
+  dplyr::group_by(hex_id) |>
+  dplyr::summarize(
+    street_trees = dplyr::n()
+  )
+
+road_lengths <- roads |>
+  sf::st_intersection(hex_grid) |>
+  dplyr::mutate(
+    length = sf::st_length(geometry)
+  ) |>
+  sf::st_drop_geometry() |>
+  dplyr::group_by(hex_id) |>
+  dplyr::summarize(
+    street_length = sum(length)
+  )
+
+hex <- hex_grid |>
+  dplyr::left_join(
+    tree_counts,
+    by = "hex_id"
+  ) |>
+  dplyr::left_join(
+    road_lengths,
+    by = "hex_id"
+  ) |>
+  dplyr::mutate(
+    trees_p_hmile = units::drop_units(street_trees / (street_length / 2640))
+  ) |>
+  tidyr::drop_na(trees_p_hmile) |>
+  sf::st_write('tree_hex.geojson', delete_dsn = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+require('sf')
+require('dplyr')
+require('spdep')
+
+hex <- st_read('tree_hex.geojson')
+neighborhood <- poly2nb(hex, queen=FALSE)
+listw <- nb2listw(
+  neighbours=neighborhood, 
+  style='B'
+)
+```
+
+That should have been fairly familiar. The next thing we do is run the `localG` function from the `spdep` package.
+
+```{r}
+g <- localG(as.numeric(hex$trees_p_hmile), 
+            listw=listw
+            )
+head(g)
+```
+
+Hmmm... we see a few negative values. This should make us stop for a moment. The $ G_{i} $ statistic is defined as...
+
+$$
+G_{i}(d) = \frac{\sum_{j=1, i\neq j}^{n}{w_{ij}(d)x_{j}}}{\sum_{j=1}^{n}x_{j}}
+$$
+
+In other words, the proportion of the sum of all observed values accounted for in the defined neighborhood. So negative values are a bit surprising. Also, the domain doesn't seem to match what we'd expect from a proportion. So what's happening here?
+
+It turns out that the `localG` function is giving us z-scores, or standard deviations from the mean. This is diagnostically useful, but it doesn't actually return the statistic of interest. To return the statistic of interest ($ G_{i} $), the `return_internals` parameter of the `localG` function must be true.
+
+```{r}
+# G value(`G`), expected value (`EG`), variance (`VG`)
+g <- localG(as.numeric(hex$trees_p_hmile), 
+            listw=listw, 
+            zero.policy=FALSE, 
+            return_internals=TRUE
+            )
+```
+
+We can access these 'internals', which include the $ G_{i} $ value (`G`), its expected value (`EG`), and its variance (`VG`). We can also examine the frequency distribution of our $ G_{i} $ statistic values.
+
+```{r}
+head(g)
+head(attr(g, 'internals'))
+hist(attr(g, 'internals')[,1], breaks=15)
+```
+
+This is more like it---a histogram tells us that our G values are distributed (somewhat) normally, with a long right tall, between 0 and 0.07. A much more reasonable domain for a proportion! Let's assign a few of these statistics to spatial data so that we can display them on a map. (Note that the `'internals'` are stored as an attribute on the `g` object, accessible using the `attr()` function.)
+
+```{r}
+hex$g <- attr(g, 'internals')[,1]
+plot(hex['g'])
+```
+
+We see relatively high positive G values near Harvard Square, MIT, and Danehy Park... this comports with our intuition! High-valued clusters are going to be in those areas where there are relatively many trees represented in the data set and relatively fewer streets. University campuses and large reservoir-adjacent parks certainly fit that bill. We see similar patterns when we map the z-scores for the G statistic...
+
+```{r}
+hex$g_z <- g
+plot(hex['g_z'])
+```
+
+
+The G statistic informs us that there are regions with G statistics both _well-above_ and _well-below_ the mean; the latter are concentrated around campuses and parks. The latter are concentrated in and around, for example, Union Square in Somerville.
+
+### Inference
+
+Ordinarily, we could simply consult our p-values and determine which were statistically significant. However, this approach is dubious here... let's check out what proportion of our observations would be considered statistically significant under a normal p-value test. We can count how many regions meet a normal $ p < 0.05 $ significance threshold.
+
+We first convert our z-scores to pvalues. Here, we're calculating a vector of p scores using the `pnorm` function with the absolute value of the `z` scores. (We multiply by 2 because it is a two-sided test - are z-scores positive or negative).This answers the question: what is the probability that the given z score is greater or less than the expected value in either the positive or the negative direction?
+
+```{r}
+hex$g_p <- 2 * pnorm(abs(hex$g_z), lower.tail=FALSE)
+```
+
+Let's use this derived p-score field to estimate how many cells are statistically significant, assuming a $ p < 0.05 $ significance threshold.
+
+```{r}
+count(hex[hex$g_p < 0.05,])
+count(hex[hex$g_p < 0.05,]) / count(hex)
+```
+
+## Getis Ord Gi-star
+
+Above, we calculated the $ G_{i} $ statistic, which constructs neighborhoods in which i is not equal to j. It is also generally worth calculating the $ G_{i}^{*} $ statistic as well, which includes the area on which the statistic is being calculated in the 'neighborhood'. To refresh our memory, the statistic is essentially the same, except the numerator is summed for all $ j $, including the case when $ i = J $:
+
+$$
+G_{i}(d) = \frac{\sum_{j=1}^{n}{w_{ij}(d)x_{j}}}{\sum_{j=1}^{n}x_{j}}
+$$
+
+To calculate this in R, we simply need to modify our weight list (`listw`). By default, the `nb2listw` function does not include each observation in its own neighborhood. We can confirm this by examining the first several rows of the `listw` object...
+
+```{r}
+head(listw$neighbours)
+```
+
+The cell in index position 1 does not include index position 1 in its neighborhood. The cell in index position 2 does not include index position 2 in its neighborhood. This is standard practice! However, the $ G_{i}^{*}$ statistic is based on a neighborhood that includes the observation from which the neighborhood is constructed---it is self-inclusive! To construct an appropriate weights list, we can use the `include.self()` function.
+
+```{r}
+listw_selfinc <- nb2listw(
+  neighbours=include.self(neighborhood), 
+  style='B'
+)
+head(listw_selfinc$neighbours)
+```
+
+Note the difference here! For index position 1, index position 1 is included. For index position 2, index position 2 is included in the neighborhood. We've built a self-inclusive weights list! The remainder of the exercise should be identical... we'll move on for a moment to address the local Moran's I, but this is going to be part of the take-home.
+
+## Local Moran's I
+
+The Getis Ord statistic is used to analyze so-called 'hot spots' and 'cold spots'---in other words, areas where high values are clustered with high values and low values are clustered with low values. It's customary to calculate a local Moran's I alongside the G statistics, which tells us something similar, but distinct: where do like values tend to be clustered and where do nearby values tend to be different?
+
+Recall that we defined the statistic such that...
+
+$$
+I_{i} = \frac{(x_i-\bar{x})}{S^{2}}{\sum_{j=1}^{n}w_{ij}(x_{j}-\bar{x})}
+$$
+
+Where the first term is the difference between an observed value and the sample mean divided by the sample variance, and the second term is the weighted sum of the differece between neighboring observations and the sample mean. This can also be exapnded...
+
+$$
+I_{i} = \frac{(x_i-\bar{x})}{{\sum_{k=1}^{n}(x_k-\bar{x})^2}/(n-1)}{\sum_{j=1}^{n}w_{ij}(x_{j}-\bar{x})}
+$$
+
+As such, the process is somewhat similar the above. We begin by calculating the statistic using the `localmoran` function on the value of `trees_p_hmile` using the binary weights list. To match the above, we have a two-sided altenrative hypothesis, in which our z-scores are either greater than or less than 0.
+
+```{r}
+mi <- localmoran(as.vector(hex$trees_p_hmile), listw, alternative='two.sided')
+head(mi)
+```
+
+Note that the `localmoran` function  gives us a means to adjust the p values and account for the nonindependence adjacent statistics. Note also that it returns five columns: the local I (`Ii`), the expected value of the local I (`E.Ii`), the variance of the local I (`Var.Ii`), the Z-score for the local I (`Z.Ii`) and the p value (`Pr(z>0)`).
+
+Let's attach some of these to our `hex` dataset so that we can map them!
+
+```{r}
+hex$mi <- mi[,1]
+plot(hex['mi'])
+```
+
+We see, as expected, very high levels of positive local autocorrelation near Harvard Yard, Danehy Park, and, to a lesser extent MIT and Riverside. Let's check out the z-scores to smap deviations from the mean...
+
+```{r}
+hex$mi_z <- mi[,4]
+plot(hex['mi_z'])
+```
+
+And our unadjusted p-scores can be bound to the `hex` like this...
+
+```{r}
+hex$mi_p <- mi[,5]
+plot(hex['mi_p'])
+```
+
+## Take-Home
+
+Complete the following exercises by next Tuesday's lab start time (4pm). Once you've calculated the necessary statistics, you may find it helpful to use QGIS to visualize your resuls on a basemap! These are local statistics and, as such, local context matters. Use these statistics as a quantitative way to think about place!
+
+1. Above, we began the process of evaluating the $ G_{i}^{*} $ statistic for the observed trees per linear foot in each hexagon cell. Complete this process and comment on your results----how are they different than the $ G_{i} $? What might you be lead to infer from the $ G_{i}^{*} $ that you might not from the $ G_{i} $? Speak about this with reference to levels of statistical significance, etc.
+
+2. Generate a new metric which is street trees per half mile, excluding all trees in parks or open space (`st_trees_p_hmile`). To calculate this statistic, remove all trees that were in parks, open space, or campus land before calculating the counts. You'll need to source some additional data from the City of Cambridge and the City of Somerville. Take this metric and calculate the three statistics we covered in lab above and comment on your results.Where are the hot and cold spots? Where is there clustering (positive autocorrelation) and where is there dispersion? Compare to the local statistics for total trees per square foot of street length.
